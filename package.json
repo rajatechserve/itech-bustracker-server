@@ -1,0 +1,28 @@
+{
+  "name": "school-bus-server-full",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node src/index.js",
+    "migrate": "node src/migrate.js",
+    "reset-db": "node src/resetDb.js"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.3",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.0",
+    "multer": "^2.0.2",
+    "nodemailer": "^7.0.10",
+    "sqlite3": "^5.1.6",
+    "swagger-ui-express": "^4.6.3",
+    "uuid": "^9.0.0",
+    "yamljs": "^0.3.0"
+  }
+}
