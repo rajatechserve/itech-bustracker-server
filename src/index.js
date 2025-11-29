@@ -27,24 +27,17 @@ if (!fs.existsSync(UPLOADS_DIR)) {
     fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 
-// Serve static files from uploads directory
+// Deprecated: serving static files. We will prefer DB-stored images via routes.
 app.use('/uploads', express.static(UPLOADS_DIR));
 
 // Configure multer for file uploads
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, UPLOADS_DIR);
-    },
-    filename: (req, file, cb) => {
-        const uniqueName = `${Date.now()}-${uuidv4()}${path.extname(file.originalname)}`;
-        cb(null, uniqueName);
-    }
-});
+// Memory storage for storing images in DB, not filesystem
+const memoryStorage = multer.memoryStorage();
 
-const upload = multer({
-    storage: storage,
+const uploadMem = multer({
+    storage: memoryStorage,
     limits: {
-        fileSize: 2 * 1024 * 1024 // 2MB max for banner, we'll check logo separately
+        fileSize: 1 * 1024 * 1024 // default 1MB; specific routes will override
     },
     fileFilter: (req, file, cb) => {
         const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
@@ -1150,50 +1143,93 @@ app.get('/api/schools', authenticateToken, async (req, res) => {
     }
 });
 
-// Upload school logo (500KB limit)
+// Upload school logo (500KB max) — store in DB, return serving URL
 app.post('/api/upload/logo', authenticateToken, (req, res) => {
     const logoUpload = multer({
-        storage: storage,
-        limits: { fileSize: 500 * 1024 }, // 500KB
+        storage: memoryStorage,
+        limits: { fileSize: 500 * 1024 },
         fileFilter: (req, file, cb) => {
             const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-            if (allowedTypes.includes(file.mimetype)) {
-                cb(null, true);
-            } else {
-                cb(new Error('Only image files are allowed'));
-            }
+            if (allowedTypes.includes(file.mimetype)) cb(null, true); else cb(new Error('Only image files are allowed'));
         }
     }).single('logo');
 
-    logoUpload(req, res, (err) => {
-        if (err) {
-            if (err.code === 'LIMIT_FILE_SIZE') {
-                return res.status(400).json({ error: 'Logo file size must be less than 500KB' });
+    logoUpload(req, res, async (err) => {
+        try {
+            if (err) {
+                if (err.code === 'LIMIT_FILE_SIZE') return res.status(400).json({ error: 'Logo file size must be less than 500KB' });
+                return res.status(400).json({ error: err.message });
             }
-            return res.status(400).json({ error: err.message });
+            if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+            const schoolId = req.user?.role === 'school' ? req.user.id : (req.user?.role === 'admin' ? (req.body?.schoolId || null) : req.user?.schoolId);
+            if (!schoolId) return res.status(400).json({ error: 'schoolId scope required' });
+            // Store as base64 data URL in DB for portability
+            const mime = req.file.mimetype;
+            const dataUrl = `data:${mime};base64,${req.file.buffer.toString('base64')}`;
+            await runSql('UPDATE schools SET logo=? WHERE id=?', [dataUrl, schoolId]);
+            return res.json({ path: `/api/schools/${schoolId}/logo`, size: req.file.size });
+        } catch (e) {
+            return res.status(500).json({ error: e.message });
         }
-        if (!req.file) {
-            return res.status(400).json({ error: 'No file uploaded' });
-        }
-        const filePath = `/uploads/${req.file.filename}`;
-        res.json({ path: filePath, filename: req.file.filename });
     });
 });
 
-// Upload school banner (2MB limit)
-app.post('/api/upload/banner', authenticateToken, upload.single('banner'), (req, res) => {
+// Upload school banner (1MB max) — store in DB, return serving URL
+app.post('/api/upload/banner', authenticateToken, (req, res) => {
+    const bannerUpload = multer({
+        storage: memoryStorage,
+        limits: { fileSize: 1 * 1024 * 1024 },
+        fileFilter: (req, file, cb) => {
+            const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+            if (allowedTypes.includes(file.mimetype)) cb(null, true); else cb(new Error('Only image files are allowed'));
+        }
+    }).single('banner');
+
+    bannerUpload(req, res, async (err) => {
+        try {
+            if (err) {
+                if (err.code === 'LIMIT_FILE_SIZE') return res.status(400).json({ error: 'Banner file size must be less than 1MB' });
+                return res.status(400).json({ error: err.message });
+            }
+            if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+            const schoolId = req.user?.role === 'school' ? req.user.id : (req.user?.role === 'admin' ? (req.body?.schoolId || null) : req.user?.schoolId);
+            if (!schoolId) return res.status(400).json({ error: 'schoolId scope required' });
+            const mime = req.file.mimetype;
+            const dataUrl = `data:${mime};base64,${req.file.buffer.toString('base64')}`;
+            await runSql('UPDATE schools SET photo=? WHERE id=?', [dataUrl, schoolId]);
+            return res.json({ path: `/api/schools/${schoolId}/banner`, size: req.file.size });
+        } catch (e) {
+            return res.status(500).json({ error: e.message });
+        }
+    });
+});
+
+// Serve logo/banner from DB (data URL stored)
+app.get('/api/schools/:id/logo', async (req, res) => {
     try {
-        if (!req.file) {
-            return res.status(400).json({ error: 'No file uploaded' });
-        }
-        const filePath = `/uploads/${req.file.filename}`;
-        res.json({ path: filePath, filename: req.file.filename });
-    } catch (e) {
-        if (e.code === 'LIMIT_FILE_SIZE') {
-            return res.status(400).json({ error: 'Banner file size must be less than 2MB' });
-        }
-        res.status(400).json({ error: e.message });
-    }
+        const row = await getSql('SELECT logo FROM schools WHERE id=?', [req.params.id]);
+        if (!row || !row.logo) return res.status(404).send('Not found');
+        const match = /^data:(.+);base64,(.+)$/.exec(row.logo);
+        if (!match) return res.status(200).send(row.logo);
+        const mime = match[1]; const b64 = match[2];
+        const buf = Buffer.from(b64, 'base64');
+        res.setHeader('Content-Type', mime);
+        res.setHeader('Content-Length', buf.length);
+        return res.end(buf);
+    } catch (e) { return res.status(500).json({ error: e.message }); }
+});
+app.get('/api/schools/:id/banner', async (req, res) => {
+    try {
+        const row = await getSql('SELECT photo FROM schools WHERE id=?', [req.params.id]);
+        if (!row || !row.photo) return res.status(404).send('Not found');
+        const match = /^data:(.+);base64,(.+)$/.exec(row.photo);
+        if (!match) return res.status(200).send(row.photo);
+        const mime = match[1]; const b64 = match[2];
+        const buf = Buffer.from(b64, 'base64');
+        res.setHeader('Content-Type', mime);
+        res.setHeader('Content-Length', buf.length);
+        return res.end(buf);
+    } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/schools', authenticateToken, async (req, res) => {
