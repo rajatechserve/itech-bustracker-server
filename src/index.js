@@ -115,6 +115,33 @@ function ensureTables() {
                 }
             });
         });
+        // Trip persistence tables
+        db.run(`CREATE TABLE IF NOT EXISTS trips(
+            id TEXT PRIMARY KEY,
+            busId TEXT,
+            driverId TEXT,
+            schoolId TEXT,
+            direction TEXT,
+            startedAt INTEGER,
+            stoppedAt INTEGER,
+            status TEXT
+        )`);
+        db.run(`CREATE TABLE IF NOT EXISTS trip_locations(
+            id TEXT PRIMARY KEY,
+            tripId TEXT,
+            busId TEXT,
+            lat REAL,
+            lng REAL,
+            pingAt INTEGER
+        )`);
+        db.run(`CREATE TABLE IF NOT EXISTS trip_events(
+            id TEXT PRIMARY KEY,
+            tripId TEXT,
+            busId TEXT,
+            type TEXT,
+            data TEXT,
+            createdAt INTEGER
+        )`);
     });
 }
 ensureTables();
@@ -1319,6 +1346,31 @@ app.post('/api/schools/:id/contract', authenticateToken, async (req, res) => {
 // ------------------ NOTIFICATIONS ------------------
 const nodemailer = require('nodemailer');
 const transporter = nodemailer.createTransport({ host: process.env.SMTP_HOST || 'localhost', port: process.env.SMTP_PORT ? parseInt(process.env.SMTP_PORT) : 25, secure: false, tls: { rejectUnauthorized: false } });
+// WhatsApp notifications via Twilio (optional)
+let twilioClient = null;
+try {
+    const sid = process.env.TWILIO_ACCOUNT_SID;
+    const token = process.env.TWILIO_AUTH_TOKEN;
+    if (sid && token) {
+        twilioClient = require('twilio')(sid, token);
+        console.log('Twilio client initialized for WhatsApp notifications');
+    }
+} catch (e) {
+    console.warn('Twilio not configured:', e.message);
+}
+
+async function sendWhatsApp(toPhone, message) {
+    try {
+        if (!twilioClient) return false;
+        const fromWhatsApp = process.env.TWILIO_WHATSAPP_FROM || 'whatsapp:+14155238886'; // Default Twilio sandbox number
+        const toWhatsApp = `whatsapp:${toPhone.startsWith('+') ? toPhone : '+' + toPhone}`;
+        await twilioClient.messages.create({ from: fromWhatsApp, to: toWhatsApp, body: message });
+        return true;
+    } catch (e) {
+        console.warn('WhatsApp send failed:', e.message);
+        return false;
+    }
+}
 app.post('/api/notifications/email', authenticateToken, async (req, res) =>
 {
     try
@@ -1424,5 +1476,249 @@ app.get('/api/schools/:id/dashboard', authenticateToken, async (req, res) => {
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true, now: Date.now() }));
+
+// ------------------ TRIPS (in-memory minimal) ------------------
+const activeTrips = new Map(); // key: busId, value: { tripId, busId, driverId, schoolId, direction: 'morning'|'evening', startedAt, lastPingAt, status: 'running'|'stopped' }
+// Minimal in-memory stop state per trip
+const tripStops = new Map(); // key: busId, value: { currentStopIndex: number, arrivedAt?: number, dropped: Record<string, number>, approached: Set<number> }
+
+app.post('/api/trips/start', authenticateToken, async (req, res) => {
+    try {
+        if (req.user?.role !== 'driver' && req.user?.role !== 'admin') return res.status(403).json({ error: 'driver/admin only' });
+        const { busId, direction } = req.body || {};
+        if (!busId) return res.status(400).json({ error: 'busId required' });
+        const dir = direction === 'evening' ? 'evening' : 'morning';
+        const tripId = uuidv4();
+        const startedAt = Date.now();
+        activeTrips.set(busId, { tripId, busId, driverId: req.user.id, schoolId: req.user.schoolId || null, direction: dir, startedAt, lastPingAt: startedAt, status: 'running' });
+        tripStops.set(busId, { currentStopIndex: 0, dropped: {}, approached: new Set() });
+        await runSql('UPDATE buses SET started=? WHERE id=?', [1, busId]);
+        await runSql('INSERT INTO trips(id,busId,driverId,schoolId,direction,startedAt,status) VALUES(?,?,?,?,?,?,?)', [tripId, busId, req.user.id, req.user.schoolId || null, dir, startedAt, 'running']);
+        await runSql('INSERT INTO trip_events(id,tripId,busId,type,data,createdAt) VALUES(?,?,?,?,?,?)', [uuidv4(), tripId, busId, 'trip_started', JSON.stringify({ direction: dir }), Date.now()]);
+        // Notify parents (WhatsApp) of students on this bus
+        try {
+            const parentsOnBus = await allSql('SELECT DISTINCT p.phone as phone, s.name as studentName FROM students s JOIN parents p ON s.parentId=p.id WHERE s.busId=? AND p.phone IS NOT NULL', [busId]);
+            const school = await getSql('SELECT name FROM schools WHERE id=?', [req.user.schoolId || null]);
+            const schoolName = school?.name || 'School';
+            const dirWord = dir === 'evening' ? 'Evening' : 'Morning';
+            for (const p of parentsOnBus) {
+                const msg = `🚌 ${schoolName}: ${dirWord} trip started for ${p.studentName}.`;
+                await sendWhatsApp(p.phone, msg);
+            }
+        } catch (e) { console.warn('Trip start notify failed:', e.message); }
+        res.json(activeTrips.get(busId));
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/trips/stop', authenticateToken, async (req, res) => {
+    try {
+        if (req.user?.role !== 'driver' && req.user?.role !== 'admin') return res.status(403).json({ error: 'driver/admin only' });
+        const { busId } = req.body || {};
+        if (!busId) return res.status(400).json({ error: 'busId required' });
+        const trip = activeTrips.get(busId);
+        if (!trip) return res.status(404).json({ error: 'no active trip' });
+        trip.status = 'stopped';
+        trip.stoppedAt = Date.now();
+        activeTrips.delete(busId);
+        tripStops.delete(busId);
+        await runSql('UPDATE buses SET started=? WHERE id=?', [0, busId]);
+        await runSql('UPDATE trips SET stoppedAt=?, status=? WHERE id=?', [trip.stoppedAt, 'stopped', trip.tripId]);
+        await runSql('INSERT INTO trip_events(id,tripId,busId,type,data,createdAt) VALUES(?,?,?,?,?,?)', [uuidv4(), trip.tripId, busId, 'trip_stopped', JSON.stringify({}), Date.now()]);
+        res.json({ stopped: true, tripId: trip.tripId, stoppedAt: trip.stoppedAt });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Update location and touch trip last ping if active
+app.post('/api/trips/:busId/location', authenticateToken, async (req, res) => {
+    try {
+        const { busId } = req.params;
+        const { lat, lng } = req.body || {};
+        if (typeof lat !== 'number' || typeof lng !== 'number') return res.status(400).json({ error: 'lat/lng numeric required' });
+        await runSql('UPDATE buses SET lat=?, lng=? WHERE id=? OR number=?', [lat, lng, busId, busId]);
+        const trip = activeTrips.get(busId);
+        if (trip) {
+            trip.lastPingAt = Date.now();
+            await runSql('INSERT INTO trip_locations(id,tripId,busId,lat,lng,pingAt) VALUES(?,?,?,?,?,?)', [uuidv4(), trip.tripId, busId, lat, lng, Date.now()]);
+
+            // Geofenced approaching notification to next stop
+            try {
+                const state = tripStops.get(busId) || { currentStopIndex: 0, dropped: {}, approached: new Set() };
+                const routeRow = await getSql('SELECT stops FROM routes WHERE id=?', [trip.routeId || null]);
+                if (routeRow && routeRow.stops) {
+                    const stops = JSON.parse(routeRow.stops);
+                    const nextIdx = Math.max(0, state.currentStopIndex || 0);
+                    const nextStop = stops[nextIdx];
+                    if (nextStop && typeof nextStop.lat === 'number' && typeof nextStop.lng === 'number') {
+                        const toRad = (v) => v * Math.PI / 180;
+                        const R = 6371000;
+                        const dLat = toRad(nextStop.lat - lat);
+                        const dLng = toRad(nextStop.lng - lng);
+                        const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat)) * Math.cos(toRad(nextStop.lat)) * Math.sin(dLng/2)**2;
+                        const distance = 2 * R * Math.asin(Math.sqrt(a));
+                        const threshold = 400; // meters to consider "approaching"
+                        if (distance <= threshold && !state.approached.has(nextIdx)) {
+                            state.approached.add(nextIdx);
+                            await runSql('INSERT INTO trip_events(id,tripId,busId,type,data,createdAt) VALUES(?,?,?,?,?,?)', [uuidv4(), trip.tripId, busId, 'approach_stop', JSON.stringify({ index: nextIdx, distance }), Date.now()]);
+                            // Notify parents near this stop (same matching as arrive)
+                            try {
+                                const candidates = await allSql('SELECT s.id as studentId, s.name as studentName, s.pickupLat as lat, s.pickupLng as lng, p.phone as phone FROM students s JOIN parents p ON s.parentId=p.id WHERE s.busId=? AND p.phone IS NOT NULL', [busId]);
+                                const within = [];
+                                for (const c of candidates) {
+                                    if (typeof c.lat === 'number' && typeof c.lng === 'number') {
+                                        const dLat2 = toRad(nextStop.lat - c.lat);
+                                        const dLng2 = toRad(nextStop.lng - c.lng);
+                                        const a2 = Math.sin(dLat2/2)**2 + Math.cos(toRad(c.lat)) * Math.cos(toRad(nextStop.lat)) * Math.sin(dLng2/2)**2;
+                                        const d2 = 2 * R * Math.asin(Math.sqrt(a2));
+                                        if (d2 <= 500) within.push(c); // 500m notify radius for approaching
+                                    }
+                                }
+                                for (const p of within) {
+                                    await sendWhatsApp(p.phone, `⏳ Bus is approaching your stop for ${p.studentName}. ETA ~${Math.max(1, Math.round(distance / 250))} min.`);
+                                }
+                            } catch (e) { console.warn('Approach stop notify failed:', e.message); }
+                            tripStops.set(busId, state);
+                        }
+                    }
+                }
+            } catch (e) { console.warn('Approaching check failed:', e.message); }
+        }
+        res.json({ ok: true, busId, lat, lng, running: !!trip });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Arrive at current stop (advance index optional)
+app.post('/api/trips/:busId/arrive-stop', authenticateToken, async (req, res) => {
+    try {
+        if (req.user?.role !== 'driver' && req.user?.role !== 'admin') return res.status(403).json({ error: 'driver/admin only' });
+        const { busId } = req.params;
+        const { advance } = req.body || {};
+        const trip = activeTrips.get(busId);
+        if (!trip) return res.status(404).json({ error: 'no active trip' });
+        const state = tripStops.get(busId) || { currentStopIndex: 0, dropped: {} };
+        state.arrivedAt = Date.now();
+        await runSql('INSERT INTO trip_events(id,tripId,busId,type,data,createdAt) VALUES(?,?,?,?,?,?)', [uuidv4(), trip.tripId, busId, 'arrive_stop', JSON.stringify({ currentStopIndex: state.currentStopIndex, advance: !!advance }), Date.now()]);
+        // Notify only parents whose students are tied to this stop (nearest-stop matching)
+        try {
+            const route = await getSql('SELECT stops FROM routes WHERE id=?', [trip.routeId || null]);
+            let stopCoord = null;
+            if (route && route.stops) {
+                try {
+                    const stops = JSON.parse(route.stops);
+                    const idx = Math.max(0, state.currentStopIndex || 0);
+                    const s = stops[idx];
+                    if (s && typeof s.lat === 'number' && typeof s.lng === 'number') {
+                        stopCoord = { lat: s.lat, lng: s.lng };
+                    }
+                } catch {}
+            }
+            if (stopCoord) {
+                // Find students on this bus whose pickup location is within ~100m of stop
+                const candidates = await allSql('SELECT s.id as studentId, s.name as studentName, s.pickupLat as lat, s.pickupLng as lng, p.phone as phone FROM students s JOIN parents p ON s.parentId=p.id WHERE s.busId=? AND p.phone IS NOT NULL', [busId]);
+                const within = [];
+                for (const c of candidates) {
+                    if (typeof c.lat === 'number' && typeof c.lng === 'number') {
+                        // Haversine distance in meters
+                        const toRad = (v) => v * Math.PI / 180;
+                        const R = 6371000;
+                        const dLat = toRad(stopCoord.lat - c.lat);
+                        const dLng = toRad(stopCoord.lng - c.lng);
+                        const a = Math.sin(dLat/2)**2 + Math.cos(toRad(c.lat)) * Math.cos(toRad(stopCoord.lat)) * Math.sin(dLng/2)**2;
+                        const d = 2 * R * Math.asin(Math.sqrt(a));
+                        if (d <= 120) within.push(c); // 120m radius buffer
+                    }
+                }
+                for (const p of within) {
+                    await sendWhatsApp(p.phone, `📍 Bus is arriving at your stop for ${p.studentName}.`);
+                }
+            } else {
+                // Fallback broadcast when stop coordinate unavailable
+                const parentsOnBus = await allSql('SELECT DISTINCT p.phone as phone FROM students s JOIN parents p ON s.parentId=p.id WHERE s.busId=? AND p.phone IS NOT NULL', [busId]);
+                for (const p of parentsOnBus) {
+                    await sendWhatsApp(p.phone, '🅿️ Bus has arrived at the stop.');
+                }
+            }
+        } catch (e) { console.warn('Arrive stop notify failed:', e.message); }
+        if (advance === true) state.currentStopIndex += 1;
+        tripStops.set(busId, state);
+        res.json({ ok: true, busId, currentStopIndex: state.currentStopIndex, arrivedAt: state.arrivedAt });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Mark a student dropped at current stop
+app.post('/api/trips/:busId/drop-student', authenticateToken, async (req, res) => {
+    try {
+        if (req.user?.role !== 'driver' && req.user?.role !== 'admin') return res.status(403).json({ error: 'driver/admin only' });
+        const { busId } = req.params;
+        const { studentId } = req.body || {};
+        if (!studentId) return res.status(400).json({ error: 'studentId required' });
+        const trip = activeTrips.get(busId);
+        if (!trip) return res.status(404).json({ error: 'no active trip' });
+        const state = tripStops.get(busId) || { currentStopIndex: 0, dropped: {} };
+        state.dropped[studentId] = Date.now();
+        await runSql('INSERT INTO trip_events(id,tripId,busId,type,data,createdAt) VALUES(?,?,?,?,?,?)', [uuidv4(), trip.tripId, busId, 'drop_student', JSON.stringify({ studentId }), Date.now()]);
+        // Notify this student's parent
+        try {
+            const p = await getSql('SELECT parents.phone as phone, students.name as studentName FROM students JOIN parents ON students.parentId=parents.id WHERE students.id=?', [studentId]);
+            if (p?.phone) {
+                await sendWhatsApp(p.phone, `✅ ${p.studentName} has been dropped.`);
+            }
+        } catch (e) { console.warn('Drop student notify failed:', e.message); }
+        tripStops.set(busId, state);
+        res.json({ ok: true, busId, studentId, droppedAt: state.dropped[studentId], currentStopIndex: state.currentStopIndex });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Public-ish live status for parents (scope restricted by schoolId when available)
+app.get('/api/public/bus/:busId/live', async (req, res) => {
+    try {
+        const busId = req.params.busId;
+        const bus = await getSql('SELECT id,number,driverId,routeId,schoolId,lat,lng,started FROM buses WHERE id=? OR number=?', [busId, busId]);
+        if (!bus) return res.status(404).json({ error: 'bus not found' });
+        const trip = activeTrips.get(bus.id);
+        const stopState = tripStops.get(bus.id) || null;
+        res.json({
+            id: bus.id,
+            number: bus.number,
+            schoolId: bus.schoolId,
+            running: !!trip || !!bus.started,
+            location: (bus.lat != null && bus.lng != null) ? { lat: bus.lat, lng: bus.lng } : null,
+            lastPingAt: trip?.lastPingAt || null,
+            direction: trip?.direction || null,
+            startedAt: trip?.startedAt || null,
+            tripId: trip?.tripId || null,
+            currentStopIndex: stopState?.currentStopIndex ?? null,
+            routeId: bus.routeId || null,
+        });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Trip history endpoints (admin/school scope)
+app.get('/api/trips', authenticateToken, async (req, res) => {
+    try {
+        const { busId, status } = req.query || {};
+        let sql = 'SELECT * FROM trips';
+        const where = []; const params = [];
+        if (busId && busId.trim()) { where.push('busId=?'); params.push(busId.trim()); }
+        if (status && status.trim()) { where.push('status=?'); params.push(status.trim()); }
+        if (where.length) sql += ' WHERE ' + where.join(' AND ');
+        sql += ' ORDER BY startedAt DESC';
+        const rows = await allSql(sql, params);
+        res.json(rows);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/trips/:id/locations', authenticateToken, async (req, res) => {
+    try {
+        const rows = await allSql('SELECT lat,lng,pingAt FROM trip_locations WHERE tripId=? ORDER BY pingAt ASC', [req.params.id]);
+        res.json(rows);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/trips/:id/events', authenticateToken, async (req, res) => {
+    try {
+        const rows = await allSql('SELECT type,data,createdAt FROM trip_events WHERE tripId=? ORDER BY createdAt ASC', [req.params.id]);
+        res.json(rows.map(r => ({ type: r.type, data: r.data ? JSON.parse(r.data) : null, createdAt: r.createdAt })));
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 app.listen(PORT, () => console.log(`Server listening on http://localhost:${PORT}`));
